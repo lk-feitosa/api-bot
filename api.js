@@ -3,15 +3,15 @@ const express = require('express');
 const axios = require('axios');
 const redis = require('redis');
 const morgan = require('morgan');
+const natural = require('natural'); // NLP para entender consultas
+const stopwords = require('stopword'); // Remoção de palavras irrelevantes
 
 const app = express();
 const PORT = 4000;
 
 // 🔹 Configuração do Redis
 const client = redis.createClient();
-client.connect().catch((err) => {
-    console.error("❌ Erro ao conectar ao Redis:", err);
-});
+client.connect().catch((err) => console.error("❌ Erro ao conectar ao Redis:", err));
 
 // 🔹 Middleware para logs organizados
 app.use(morgan('tiny'));
@@ -27,25 +27,61 @@ if (!GOOGLE_API_KEY || !GOOGLE_CX) {
 
 const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=`;
 
-// 🔍 **Função para buscar no Google Custom Search**
-async function searchGoogle(query, retries = 3) {
+// 📌 Dicionário de palavras-chave jurídicas
+const keywords = [
+    "lei", "código", "regulamento", "norma", "direito", "portaria",
+    "decreto", "constituição", "jurídico", "justiça", "processo", "legislação"
+];
+
+// 📌 Dicionário de sinônimos para sugestões
+const synonyms = {
+    "trabalho": ["emprego", "CLT", "direitos trabalhistas"],
+    "internet": ["wifi", "rede pública", "banda larga"],
+    "trânsito": ["carro", "moto", "transporte"],
+    "ambiental": ["meio ambiente", "ecologia", "sustentabilidade"]
+};
+
+// 🔎 **1. Pré-processador da Consulta**
+function preprocessQuery(query) {
+    // Remove palavras irrelevantes (stopwords)
+    let words = query.toLowerCase().split(" ");
+    words = stopwords.removeStopwords(words, stopwords.pt);
+    
+    // Verifica se há termos jurídicos
+    const containsLegalTerms = words.some(word => keywords.includes(word));
+    
+    return { query: words.join(" "), isLegal: containsLegalTerms };
+}
+
+// 🔍 **2. Busca no Google Custom Search**
+async function searchGoogle(query) {
     const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=10`;
 
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            console.log(`🔍 [${new Date().toLocaleString()}] Buscando no Google: ${query} (Tentativa ${attempt})`);
-            const response = await axios.get(googleApiUrl);
-            return response.data.items?.map(item => ({
-                title: item.title,
-                link: item.link,
-                snippet: item.snippet,
-                source: new URL(item.link).hostname
-            })) || [];
-        } catch (error) {
-            console.error(`❌ Erro na tentativa ${attempt} de busca no Google:`, error.message);
-            if (attempt === retries) throw error;
+    try {
+        console.log(`🔍 Buscando no Google: ${query}`);
+        const response = await axios.get(googleApiUrl);
+        return response.data.items?.map(item => ({
+            title: item.title,
+            link: item.link,
+            snippet: item.snippet,
+            source: new URL(item.link).hostname
+        })) || [];
+    } catch (error) {
+        console.error("❌ Erro na busca do Google:", error.message);
+        return [];
+    }
+}
+
+// 🔄 **3. Sugestão de Termos Alternativos**
+function suggestAlternative(query) {
+    let words = query.toLowerCase().split(" ");
+    
+    for (let word of words) {
+        if (synonyms[word]) {
+            return `❓ Nenhuma legislação encontrada para "${query}". Você pode tentar pesquisar por: "${synonyms[word].join(', ')}"`;
         }
     }
+    return "⚠️ Não encontramos leis relacionadas. Tente reformular sua pesquisa.";
 }
 
 // 📜 **Endpoint principal para pesquisa de leis**
@@ -56,7 +92,13 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
         }
 
-        console.log(`\n🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}"`);
+        console.log(`🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}"`);
+
+        // 🔹 1. Pré-processa a pesquisa
+        const processedQuery = preprocessQuery(query);
+        if (!processedQuery.isLegal) {
+            return res.json({ message: "❌ A pesquisa parece não estar relacionada a leis. Tente algo como 'Lei de trânsito no Brasil'." });
+        }
 
         const cacheKey = `search-law:${query}`;
         const cachedData = await client.get(cacheKey);
@@ -65,8 +107,8 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json(JSON.parse(cachedData));
         }
 
-        // 🔹 Busca no Google
-        let results = await searchGoogle(query);
+        // 🔹 2. Busca no Google
+        let results = await searchGoogle(processedQuery.query);
 
         if (results.length > 0) {
             console.log(`✅ ${results.length} resultados encontrados para "${query}"`);
@@ -75,13 +117,14 @@ app.get(['/search', '/buscar'], async (req, res) => {
                 results
             };
 
-            await client.setEx(cacheKey, 3600, JSON.stringify(responsePayload, null, 2)); // Salvar no cache por 1 hora
+            await client.setEx(cacheKey, 3600, JSON.stringify(responsePayload)); // Cache por 1 hora
             return res.json(responsePayload);
         }
 
-        // 🚫 Se não houver resultados, retorna uma mensagem simples
-        console.log("⚠️ Nenhuma legislação encontrada.");
-        return res.json({ message: "⚠️ Nenhuma legislação encontrada para essa pesquisa." });
+        // 🔥 3. Sugere termos alternativos
+        console.log("⚠️ Nenhuma legislação encontrada, sugerindo termos alternativos...");
+        const suggestion = suggestAlternative(query);
+        return res.json({ message: suggestion });
 
     } catch (error) {
         console.error('❌ Erro ao buscar lei:', error);
