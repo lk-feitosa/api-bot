@@ -26,7 +26,7 @@ if (!GOOGLE_API_KEY || !GOOGLE_CX) {
 
 const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=`;
 
-// 📌 Dicionário de palavras-chave jurídicas
+// 📌 Palavras-chave jurídicas
 const keywords = [
     "lei", "código", "regulamento", "norma", "direito", "portaria",
     "decreto", "constituição", "jurídico", "justiça", "processo", "legislação"
@@ -50,7 +50,7 @@ function preprocessQuery(query) {
 
 // 🔍 **2. Busca no Google Custom Search com suporte a paginação**
 async function searchGoogle(query, start = 1) {
-    const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=10&start=${start}`;
+    const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=5&start=${start}`;
 
     try {
         console.log(`🔍 Buscando no Google: ${query} (Início: ${start})`);
@@ -89,7 +89,7 @@ app.get(['/search', '/buscar'], async (req, res) => {
     try {
         const query = req.query.q;
         const page = parseInt(req.query.page) || 1;
-        const startIndex = (page - 1) * 10 + 1;
+        const startIndex = (page - 1) * 5 + 1; // Busca de 5 em 5 resultados
 
         if (!query) {
             return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
@@ -123,7 +123,7 @@ app.get(['/search', '/buscar'], async (req, res) => {
             const responsePayload = {
                 message: `📜 Encontramos ${results.length} leis relacionadas.`,
                 results,
-                nextPage: page < 5 ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
+                nextPage: results.length === 5 ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
             };
 
             await client.setEx(cacheKey, 3600, JSON.stringify(responsePayload)); // Cache por 1 hora
