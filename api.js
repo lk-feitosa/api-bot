@@ -3,8 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const redis = require('redis');
 const morgan = require('morgan');
-const natural = require('natural'); // NLP para entender consultas
-const stopwords = require('stopword'); // Remoção de palavras irrelevantes
+const stopwords = require('stopword');
 
 const app = express();
 const PORT = 4000;
@@ -43,39 +42,40 @@ const synonyms = {
 
 // 🔎 **1. Pré-processador da Consulta**
 function preprocessQuery(query) {
-    // Remove palavras irrelevantes (stopwords)
     let words = query.toLowerCase().split(" ");
     words = stopwords.removeStopwords(words, stopwords.pt);
-    
-    // Verifica se há termos jurídicos
     const containsLegalTerms = words.some(word => keywords.includes(word));
-    
     return { query: words.join(" "), isLegal: containsLegalTerms };
 }
 
-// 🔍 **2. Busca no Google Custom Search**
-async function searchGoogle(query) {
-    const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=10`;
+// 🔍 **2. Busca no Google Custom Search com suporte a paginação**
+async function searchGoogle(query, start = 1) {
+    const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=10&start=${start}`;
 
     try {
-        console.log(`🔍 Buscando no Google: ${query}`);
+        console.log(`🔍 Buscando no Google: ${query} (Início: ${start})`);
         const response = await axios.get(googleApiUrl);
-        return response.data.items?.map(item => ({
+
+        if (!response.data.items || response.data.items.length === 0) {
+            console.log("⚠️ Nenhum resultado encontrado para essa busca.");
+            return [];
+        }
+
+        return response.data.items.map(item => ({
             title: item.title,
             link: item.link,
             snippet: item.snippet,
             source: new URL(item.link).hostname
-        })) || [];
+        }));
     } catch (error) {
         console.error("❌ Erro na busca do Google:", error.message);
-        return [];
+        return null;
     }
 }
 
 // 🔄 **3. Sugestão de Termos Alternativos**
 function suggestAlternative(query) {
     let words = query.toLowerCase().split(" ");
-    
     for (let word of words) {
         if (synonyms[word]) {
             return `❓ Nenhuma legislação encontrada para "${query}". Você pode tentar pesquisar por: "${synonyms[word].join(', ')}"`;
@@ -84,15 +84,18 @@ function suggestAlternative(query) {
     return "⚠️ Não encontramos leis relacionadas. Tente reformular sua pesquisa.";
 }
 
-// 📜 **Endpoint principal para pesquisa de leis**
+// 📜 **Endpoint principal para pesquisa de leis com paginação**
 app.get(['/search', '/buscar'], async (req, res) => {
     try {
         const query = req.query.q;
+        const page = parseInt(req.query.page) || 1;
+        const startIndex = (page - 1) * 10 + 1;
+
         if (!query) {
             return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
         }
 
-        console.log(`🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}"`);
+        console.log(`🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}" (Página ${page})`);
 
         // 🔹 1. Pré-processa a pesquisa
         const processedQuery = preprocessQuery(query);
@@ -100,31 +103,34 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json({ message: "❌ A pesquisa parece não estar relacionada a leis. Tente algo como 'Lei de trânsito no Brasil'." });
         }
 
-        const cacheKey = `search-law:${query}`;
+        const cacheKey = `search-law:${query}:page:${page}`;
         const cachedData = await client.get(cacheKey);
         if (cachedData) {
-            console.log(`♻️ Resultado recuperado do cache para "${query}"`);
+            console.log(`♻️ Resultado recuperado do cache para "${query}" (Página ${page})`);
             return res.json(JSON.parse(cachedData));
         }
 
-        // 🔹 2. Busca no Google
-        let results = await searchGoogle(processedQuery.query);
+        // 🔹 2. Busca no Google com paginação
+        let results = await searchGoogle(processedQuery.query, startIndex);
+
+        if (results === null) {
+            console.log("❌ Erro ao buscar no Google, retornando erro para o bot.");
+            return res.status(500).json({ error: "Erro ao conectar com o Google. Tente novamente mais tarde." });
+        }
 
         if (results.length > 0) {
-            console.log(`✅ ${results.length} resultados encontrados para "${query}"`);
+            console.log(`✅ ${results.length} resultados encontrados para "${query}" (Página ${page})`);
             const responsePayload = {
                 message: `📜 Encontramos ${results.length} leis relacionadas.`,
-                results
+                results,
+                nextPage: page < 5 ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
             };
 
             await client.setEx(cacheKey, 3600, JSON.stringify(responsePayload)); // Cache por 1 hora
             return res.json(responsePayload);
         }
 
-        // 🔥 3. Sugere termos alternativos
-        console.log("⚠️ Nenhuma legislação encontrada, sugerindo termos alternativos...");
-        const suggestion = suggestAlternative(query);
-        return res.json({ message: suggestion });
+        return res.json({ message: "⚠️ Não encontramos mais leis relacionadas. Tente reformular sua pesquisa." });
 
     } catch (error) {
         console.error('❌ Erro ao buscar lei:', error);
