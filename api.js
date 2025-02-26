@@ -7,6 +7,7 @@ const stopwords = require('stopword');
 
 const app = express();
 const PORT = 4000;
+const RESULTS_PER_PAGE = 4;
 
 // 🔹 Configuração do Redis
 const client = redis.createClient();
@@ -20,25 +21,17 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const GOOGLE_CX = process.env.GOOGLE_CX;
 
 if (!GOOGLE_API_KEY || !GOOGLE_CX) {
-    console.error("❌ ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY ou GOOGLE_CX).");
+    console.error("❌ ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY ou GOOGLE_CX). ");
     process.exit(1);
 }
 
 const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=`;
 
-// 📌 Palavras-chave jurídicas
+// 📌 Dicionário de palavras-chave jurídicas
 const keywords = [
     "lei", "código", "regulamento", "norma", "direito", "portaria",
     "decreto", "constituição", "jurídico", "justiça", "processo", "legislação"
 ];
-
-// 📌 Dicionário de sinônimos para sugestões
-const synonyms = {
-    "trabalho": ["emprego", "CLT", "direitos trabalhistas"],
-    "internet": ["wifi", "rede pública", "banda larga"],
-    "trânsito": ["carro", "moto", "transporte"],
-    "ambiental": ["meio ambiente", "ecologia", "sustentabilidade"]
-};
 
 // 🔎 **1. Pré-processador da Consulta**
 function preprocessQuery(query) {
@@ -50,7 +43,7 @@ function preprocessQuery(query) {
 
 // 🔍 **2. Busca no Google Custom Search com suporte a paginação**
 async function searchGoogle(query, start = 1) {
-    const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=5&start=${start}`;
+    const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=${RESULTS_PER_PAGE}&start=${start}`;
 
     try {
         console.log(`🔍 Buscando no Google: ${query} (Início: ${start})`);
@@ -73,23 +66,12 @@ async function searchGoogle(query, start = 1) {
     }
 }
 
-// 🔄 **3. Sugestão de Termos Alternativos**
-function suggestAlternative(query) {
-    let words = query.toLowerCase().split(" ");
-    for (let word of words) {
-        if (synonyms[word]) {
-            return `❓ Nenhuma legislação encontrada para "${query}". Você pode tentar pesquisar por: "${synonyms[word].join(', ')}"`;
-        }
-    }
-    return "⚠️ Não encontramos leis relacionadas. Tente reformular sua pesquisa.";
-}
-
 // 📜 **Endpoint principal para pesquisa de leis com paginação**
 app.get(['/search', '/buscar'], async (req, res) => {
     try {
         const query = req.query.q;
         const page = parseInt(req.query.page) || 1;
-        const startIndex = (page - 1) * 5 + 1; // Busca de 5 em 5 resultados
+        const startIndex = (page - 1) * RESULTS_PER_PAGE + 1;
 
         if (!query) {
             return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
@@ -123,7 +105,7 @@ app.get(['/search', '/buscar'], async (req, res) => {
             const responsePayload = {
                 message: `📜 Encontramos ${results.length} leis relacionadas.`,
                 results,
-                nextPage: results.length === 5 ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
+                nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
             };
 
             await client.setEx(cacheKey, 3600, JSON.stringify(responsePayload)); // Cache por 1 hora
