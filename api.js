@@ -33,6 +33,14 @@ const keywords = [
     "decreto", "constituição", "jurídico", "justiça", "processo", "legislação"
 ];
 
+// 📌 Verifica se a busca é específica de um país ou se assume Brasil
+function detectCountry(query) {
+    if (/\b(internacional|eua|estados unidos|portugal|espanha|frança|alemanha)\b/i.test(query)) {
+        return query;
+    }
+    return query + " Brasil";
+}
+
 // 🔎 **1. Pré-processador da Consulta**
 function preprocessQuery(query) {
     let words = query.toLowerCase().split(" ");
@@ -85,6 +93,9 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json({ message: "❌ A pesquisa parece não estar relacionada a leis. Tente algo como 'Lei de trânsito no Brasil'." });
         }
 
+        // 🔹 2. Detecta se a busca deve ser para o Brasil ou outro país
+        const refinedQuery = detectCountry(processedQuery.query);
+        
         const cacheKey = `search-law:${query}:page:${page}`;
         const cachedData = await client.get(cacheKey);
         if (cachedData) {
@@ -92,8 +103,8 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json(JSON.parse(cachedData));
         }
 
-        // 🔹 2. Busca no Google com paginação
-        let results = await searchGoogle(processedQuery.query, startIndex);
+        // 🔹 3. Busca no Google com paginação
+        let results = await searchGoogle(refinedQuery, startIndex);
 
         if (results === null) {
             console.log("❌ Erro ao buscar no Google, retornando erro para o bot.");
@@ -103,7 +114,7 @@ app.get(['/search', '/buscar'], async (req, res) => {
         if (results.length > 0) {
             console.log(`✅ ${results.length} resultados encontrados para "${query}" (Página ${page})`);
             const responsePayload = {
-                message: `📜 Encontramos ${results.length} leis relacionadas.`,
+                message: `📜 Encontramos ${results.length} leis relacionadas para "${query}" (Página ${page}).`,
                 results,
                 nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
             };
