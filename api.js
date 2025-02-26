@@ -4,6 +4,7 @@ const axios = require('axios');
 const redis = require('redis');
 const morgan = require('morgan');
 const stopwords = require('stopword');
+const natural = require('natural');
 
 const app = express();
 const PORT = 4000;
@@ -33,12 +34,20 @@ const keywords = [
     "decreto", "constituição", "jurídico", "justiça", "processo", "legislação"
 ];
 
-// 📌 Verifica se a busca é específica de um país ou se assume Brasil
-function detectCountry(query) {
-    if (/\b(internacional|eua|estados unidos|portugal|espanha|frança|alemanha)\b/i.test(query)) {
-        return query;
+// 📌 Função para gerar sugestões dinâmicas
+function generateSuggestion(query) {
+    const words = query.toLowerCase().split(" ");
+    const keywordsFiltered = words.filter(word => !stopwords.pt.includes(word)); // Remove palavras irrelevantes
+
+    if (keywordsFiltered.length > 1) {
+        const stemmer = natural.PorterStemmerPt;
+        const keyword = stemmer.stem(keywordsFiltered[keywordsFiltered.length - 1]); // Usa a última palavra para gerar sugestões
+
+        if (keyword.length > 3) {
+            return `lei sobre ${keyword} em locais públicos`;
+        }
     }
-    return query + " Brasil";
+    return `lei específica sobre ${query}`;
 }
 
 // 🔎 **1. Pré-processador da Consulta**
@@ -74,7 +83,7 @@ async function searchGoogle(query, start = 1) {
     }
 }
 
-// 📜 **Endpoint principal para pesquisa de leis com paginação**
+// 📜 **Endpoint principal para pesquisa de leis com sugestões inteligentes**
 app.get(['/search', '/buscar'], async (req, res) => {
     try {
         const query = req.query.q;
@@ -93,9 +102,6 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json({ message: "❌ A pesquisa parece não estar relacionada a leis. Tente algo como 'Lei de trânsito no Brasil'." });
         }
 
-        // 🔹 2. Detecta se a busca deve ser para o Brasil ou outro país
-        const refinedQuery = detectCountry(processedQuery.query);
-        
         const cacheKey = `search-law:${query}:page:${page}`;
         const cachedData = await client.get(cacheKey);
         if (cachedData) {
@@ -103,8 +109,8 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json(JSON.parse(cachedData));
         }
 
-        // 🔹 3. Busca no Google com paginação
-        let results = await searchGoogle(refinedQuery, startIndex);
+        // 🔹 2. Busca no Google com paginação
+        let results = await searchGoogle(processedQuery.query, startIndex);
 
         if (results === null) {
             console.log("❌ Erro ao buscar no Google, retornando erro para o bot.");
@@ -114,7 +120,7 @@ app.get(['/search', '/buscar'], async (req, res) => {
         if (results.length > 0) {
             console.log(`✅ ${results.length} resultados encontrados para "${query}" (Página ${page})`);
             const responsePayload = {
-                message: `📜 Encontramos ${results.length} leis relacionadas para "${query}" (Página ${page}).`,
+                message: `📜 Encontramos ${results.length} leis relacionadas.`,
                 results,
                 nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
             };
@@ -123,7 +129,17 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json(responsePayload);
         }
 
-        return res.json({ message: "⚠️ Não encontramos mais leis relacionadas. Tente reformular sua pesquisa." });
+        // 🔥 3. Nenhum resultado encontrado? Sugere uma alternativa baseada na pesquisa original
+        console.log("⚠️ Nenhuma legislação encontrada, gerando sugestão automática...");
+        const suggestedQuery = generateSuggestion(query);
+        
+        return res.json({
+            message: `⚠️ Nenhum resultado encontrado para "${query}". O que acha de pesquisar por: *"${suggestedQuery}"*?`,
+            options: {
+                "1": `🔍 Sim, pesquisar por "${suggestedQuery}"`,
+                "2": "❌ Não, quero refazer minha busca"
+            }
+        });
 
     } catch (error) {
         console.error('❌ Erro ao buscar lei:', error);

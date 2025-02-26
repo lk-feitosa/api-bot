@@ -1,0 +1,327 @@
+BOT:
+
+require('dotenv').config();
+const fs = require('fs');
+const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const axios = require('axios');
+
+const SESSION_DIR = './sessions';
+const API_URL = process.env.API_URL || "http://localhost:4000/buscar";
+const ALLOW_GROUPS = process.env.ALLOW_GROUPS === 'true';
+
+if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR);
+
+const userState = {}; // Armazena o estado de cada usuário
+
+async function startBot() {
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+
+    const conn = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+        browser: ["Ubuntu", "Chrome", "22.04.4"],
+        syncFullHistory: true,
+    });
+
+    conn.ev.on('creds.update', saveCreds);
+
+    conn.ev.on('connection.update', async (update) => {
+        if (update.connection === 'close') {
+            console.log('⚠️ Conexão fechada! Tentando reconectar em 10 segundos...');
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            startBot();
+        }
+    });
+
+    conn.ev.on('messages.upsert', async (message) => {
+        console.log("📥 Nova mensagem recebida!");
+
+        const msg = message.messages[0];
+        if (!msg || msg.key.fromMe || !msg.message) return;
+
+        const sender = msg.key.remoteJid;
+
+        if (sender.endsWith("@g.us") && !ALLOW_GROUPS) {
+            console.log("🚫 Mensagem de grupo ignorada.");
+            return;
+        }
+
+        let text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+        const normalizedText = text.toLowerCase().trim();
+
+        // Se for um documento (PDF), processa automaticamente
+        if (msg.message.documentMessage) {
+            console.log("📄 Documento detectado! Processando...");
+            await conn.sendMessage(sender, { text: "📄 *Documento recebido! Processando...*" });
+            await processPDF(msg, sender, conn);
+            return;
+        }
+
+        // Ignora mensagens vazias
+        if (!text.trim()) {
+            console.log("🚫 Mensagem sem texto recebida, ignorando...");
+            return;
+        }
+
+        // Cumprimentos básicos
+        if (/^(oi|olá|bom dia|boa tarde|boa noite)$/i.test(normalizedText)) {
+            await sendInitialMessage(sender, conn);
+            return;
+        }
+
+        // Identifica se o usuário está na etapa inicial
+        if (!userState[sender] || userState[sender].status === "waiting_initial") {
+            if (normalizedText === "1") {
+                userState[sender] = { status: "waiting_pdf" };
+                await conn.sendMessage(sender, { text: "📄 *Aguardando o envio do PDF...*\nCaso queira cancelar, digite *3 - ❌ Sair*." });
+                return;
+            } else if (normalizedText === "2") {
+                userState[sender] = { status: "waiting_law", page: 1 };
+                await conn.sendMessage(sender, { text: "✍️ *Digite o texto sobre a lei que deseja pesquisar:*" });
+                return;
+            } else if (normalizedText === "3") {
+                delete userState[sender];
+                await conn.sendMessage(sender, { text: "🔚 *Atendimento encerrado.* Se precisar novamente, basta enviar uma mensagem!" });
+                return;
+            }
+        }
+
+        // Se o usuário está na pesquisa, mantém o estado correto
+        if (userState[sender]?.status === "after_search") {
+            if (normalizedText === "1") {
+                userState[sender].page += 1; // Aumenta a página ao pedir mais leis
+                await conn.sendMessage(sender, { text: "🔍 *Buscando mais leis relacionadas...*" });
+                await searchLegislation(userState[sender].lastQuery, sender, conn, userState[sender].page);
+                return;
+            } else if (normalizedText === "2") {
+                userState[sender] = { status: "waiting_law", page: 1 };
+                await conn.sendMessage(sender, { text: "✍️ *Digite a nova lei que deseja pesquisar:*" });
+                return;
+            } else if (normalizedText === "3") {
+                delete userState[sender];
+                await conn.sendMessage(sender, { text: "🔚 *Atendimento encerrado.* Se precisar novamente, basta enviar uma mensagem!" });
+                return;
+            }
+        }
+
+        // Pesquisa de legislação
+        if (userState[sender]?.status === "waiting_law") {
+            userState[sender] = { status: "after_search", lastQuery: text, page: 1 };
+            await conn.sendMessage(sender, { text: "🔍 *Procurando leis relacionadas...*" });
+            await searchLegislation(text, sender, conn, 1);
+            return;
+        }
+
+        // Se a mensagem não corresponder a nada, exibe a mensagem inicial
+        await sendInitialMessage(sender, conn);
+    });
+}
+
+// 📜 **Mensagem inicial com saudação dinâmica**
+function getGreeting() {
+    const hora = new Date().getHours();
+    if (hora >= 5 && hora < 12) return "🌅 Bom dia!";
+    if (hora >= 12 && hora < 18) return "🌞 Boa tarde!";
+    return "🌙 Boa noite!";
+}
+
+async function sendInitialMessage(sender, conn) {
+    userState[sender] = { status: "waiting_initial" };
+    const greeting = getGreeting();
+
+    const message = `${greeting} Eu sou o *Assistente Inteligente ALETO*.\n\n` +
+        `📜 *Posso ajudar a encontrar leis e regulamentos para análise.*\n\n` +
+        `1 - 📑 Enviar um PDF\n` +
+        `2 - 🔍 Escreva sua pesquisa, ex: "Lei sobre transporte público gratuito"\n` +
+        `3 - ❌ Sair`;
+
+    await conn.sendMessage(sender, { text: message });
+}
+
+// 🔍 **Busca legislação na API**
+async function searchLegislation(query, sender, conn, page = 1) {
+    try {
+        const response = await axios.get(`${API_URL}?q=${encodeURIComponent(query)}&page=${page}`);
+        const data = response.data;
+
+        if (data.results) {
+            let message = "📜 *Leis encontradas:*\n\n";
+            data.results.forEach((law, index) => {
+                message += `*${index + 1}. ${law.title}*\n`;
+                message += `📄 ${law.snippet}\n`;
+                message += `🔗 [Acesse Aqui](${law.link})\n\n`;
+            });
+
+            await conn.sendMessage(sender, { text: message });
+            await sendOptionsMessage(sender, conn);
+        } else {
+            await conn.sendMessage(sender, { text: "⚠️ Não encontramos mais leis relacionadas. Tente reformular sua pesquisa." });
+            await sendOptionsMessage(sender, conn);
+        }
+    } catch (error) {
+        console.error("❌ Erro ao buscar legislação:", error.message);
+        await conn.sendMessage(sender, { text: "❌ Erro ao conectar com a API. Tente novamente mais tarde." });
+    }
+}
+
+// 📌 **Enviar opções após pesquisa**
+async function sendOptionsMessage(sender, conn) {
+    userState[sender].status = "after_search";
+
+    const message = `🔘 *Escolha uma opção abaixo:*\n\n` +
+        `1 - 📑 Mais leis relacionadas...\n` +
+        `2 - 🔍 Nova pesquisa, ex: "Lei sobre transporte público gratuito"\n` +
+        `3 - ❌ Sair`;
+
+    await conn.sendMessage(sender, { text: message });
+}
+
+startBot();
+
+module.exports = { startBot };
+
+
+
+
+API:
+
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const redis = require('redis');
+const morgan = require('morgan');
+const stopwords = require('stopword');
+
+const app = express();
+const PORT = 4000;
+const RESULTS_PER_PAGE = 4;
+
+// 🔹 Configuração do Redis
+const client = redis.createClient();
+client.connect().catch((err) => console.error("❌ Erro ao conectar ao Redis:", err));
+
+// 🔹 Middleware para logs organizados
+app.use(morgan('tiny'));
+
+// 🔹 Configuração de APIs externas
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_CX = process.env.GOOGLE_CX;
+
+if (!GOOGLE_API_KEY || !GOOGLE_CX) {
+    console.error("❌ ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY ou GOOGLE_CX). ");
+    process.exit(1);
+}
+
+const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=`;
+
+// 📌 Dicionário de palavras-chave jurídicas
+const keywords = [
+    "lei", "código", "regulamento", "norma", "direito", "portaria",
+    "decreto", "constituição", "jurídico", "justiça", "processo", "legislação"
+];
+
+// 📌 Verifica se a busca é específica de um país ou se assume Brasil
+function detectCountry(query) {
+    if (/\b(internacional|eua|estados unidos|portugal|espanha|frança|alemanha)\b/i.test(query)) {
+        return query;
+    }
+    return query + " Brasil";
+}
+
+// 🔎 **1. Pré-processador da Consulta**
+function preprocessQuery(query) {
+    let words = query.toLowerCase().split(" ");
+    words = stopwords.removeStopwords(words, stopwords.pt);
+    const containsLegalTerms = words.some(word => keywords.includes(word));
+    return { query: words.join(" "), isLegal: containsLegalTerms };
+}
+
+// 🔍 **2. Busca no Google Custom Search com suporte a paginação**
+async function searchGoogle(query, start = 1) {
+    const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=${RESULTS_PER_PAGE}&start=${start}`;
+
+    try {
+        console.log(`🔍 Buscando no Google: ${query} (Início: ${start})`);
+        const response = await axios.get(googleApiUrl);
+
+        if (!response.data.items || response.data.items.length === 0) {
+            console.log("⚠️ Nenhum resultado encontrado para essa busca.");
+            return [];
+        }
+
+        return response.data.items.map(item => ({
+            title: item.title,
+            link: item.link,
+            snippet: item.snippet,
+            source: new URL(item.link).hostname
+        }));
+    } catch (error) {
+        console.error("❌ Erro na busca do Google:", error.message);
+        return null;
+    }
+}
+
+// 📜 **Endpoint principal para pesquisa de leis com paginação**
+app.get(['/search', '/buscar'], async (req, res) => {
+    try {
+        const query = req.query.q;
+        const page = parseInt(req.query.page) || 1;
+        const startIndex = (page - 1) * RESULTS_PER_PAGE + 1;
+
+        if (!query) {
+            return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
+        }
+
+        console.log(`🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}" (Página ${page})`);
+
+        // 🔹 1. Pré-processa a pesquisa
+        const processedQuery = preprocessQuery(query);
+        if (!processedQuery.isLegal) {
+            return res.json({ message: "❌ A pesquisa parece não estar relacionada a leis. Tente algo como 'Lei de trânsito no Brasil'." });
+        }
+
+        // 🔹 2. Detecta se a busca deve ser para o Brasil ou outro país
+        const refinedQuery = detectCountry(processedQuery.query);
+        
+        const cacheKey = `search-law:${query}:page:${page}`;
+        const cachedData = await client.get(cacheKey);
+        if (cachedData) {
+            console.log(`♻️ Resultado recuperado do cache para "${query}" (Página ${page})`);
+            return res.json(JSON.parse(cachedData));
+        }
+
+        // 🔹 3. Busca no Google com paginação
+        let results = await searchGoogle(refinedQuery, startIndex);
+
+        if (results === null) {
+            console.log("❌ Erro ao buscar no Google, retornando erro para o bot.");
+            return res.status(500).json({ error: "Erro ao conectar com o Google. Tente novamente mais tarde." });
+        }
+
+        if (results.length > 0) {
+            console.log(`✅ ${results.length} resultados encontrados para "${query}" (Página ${page})`);
+            const responsePayload = {
+                message: `📜 Encontramos ${results.length} leis relacionadas para "${query}" (Página ${page}).`,
+                results,
+                nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
+            };
+
+            await client.setEx(cacheKey, 3600, JSON.stringify(responsePayload)); // Cache por 1 hora
+            return res.json(responsePayload);
+        }
+
+        return res.json({ message: "⚠️ Não encontramos mais leis relacionadas. Tente reformular sua pesquisa." });
+
+    } catch (error) {
+        console.error('❌ Erro ao buscar lei:', error);
+        res.status(500).json({ error: 'Erro ao processar a solicitação' });
+    }
+});
+
+// 🚀 **Inicia a API**
+app.listen(PORT, () => {
+    console.log(`\n🚀 =========================================`);
+    console.log(`🚀 API de Pesquisa de Leis rodando na porta ${PORT}`);
+    console.log(`🚀 Alias disponíveis: "/search" e "/buscar"`);
+    console.log(`🚀 =========================================`);
+});
