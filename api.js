@@ -20,6 +20,7 @@ app.use(morgan('tiny'));
 // 🔹 Configuração de APIs externas
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const GOOGLE_CX = process.env.GOOGLE_CX;
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 
 if (!GOOGLE_API_KEY || !GOOGLE_CX) {
     console.error("❌ ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY ou GOOGLE_CX). ");
@@ -34,31 +35,40 @@ const keywords = [
     "decreto", "constituição", "jurídico", "justiça", "processo", "legislação"
 ];
 
-// 📌 Função para gerar sugestões dinâmicas
-function generateSuggestion(query) {
-    const words = query.toLowerCase().split(" ");
-    const keywordsFiltered = words.filter(word => !stopwords.pt.includes(word)); // Remove palavras irrelevantes
+// 📌 Importando corretamente as stopwords em português
+const stopwordsPt = stopwords.pt || stopwords["pt"] || [];
 
-    if (keywordsFiltered.length > 1) {
-        const stemmer = natural.PorterStemmerPt;
-        const keyword = stemmer.stem(keywordsFiltered[keywordsFiltered.length - 1]); // Usa a última palavra para gerar sugestões
-
-        if (keyword.length > 3) {
-            return `lei sobre ${keyword} em locais públicos`;
-        }
+// 📌 Classificação semântica da consulta
+function isValidLegalQuery(query) {
+    if (!query || typeof query !== "string") {
+        return false;
     }
-    return `lei específica sobre ${query}`;
+
+    const words = query.toLowerCase().split(" ");
+
+    // Garante que 'words' seja um array antes de remover stopwords
+    let filteredWords;
+    try {
+        filteredWords = stopwords.removeStopwords(words, stopwordsPt);
+    } catch (error) {
+        console.error("Erro ao remover stopwords:", error);
+        filteredWords = words; // Se der erro, mantém as palavras originais
+    }
+
+    // Se a frase tiver menos de 2 palavras após remover stopwords, ela pode ser muito vaga
+    if (filteredWords.length < 2) {
+        return false;
+    }
+
+    // Usa NLP para verificar o contexto jurídico
+    const stemmer = natural.PorterStemmerPt;
+    const stemmedWords = filteredWords.map(word => stemmer.stem(word));
+
+    // Se houver ao menos uma palavra jurídica, a consulta é válida
+    return stemmedWords.some(word => keywords.includes(word));
 }
 
-// 🔎 **1. Pré-processador da Consulta**
-function preprocessQuery(query) {
-    let words = query.toLowerCase().split(" ");
-    words = stopwords.removeStopwords(words, stopwords.pt);
-    const containsLegalTerms = words.some(word => keywords.includes(word));
-    return { query: words.join(" "), isLegal: containsLegalTerms };
-}
-
-// 🔍 **2. Busca no Google Custom Search com suporte a paginação**
+// 🔍 **Busca no Google Custom Search com suporte a paginação**
 async function searchGoogle(query, start = 1) {
     const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=${RESULTS_PER_PAGE}&start=${start}`;
 
@@ -96,21 +106,21 @@ app.get(['/search', '/buscar'], async (req, res) => {
 
         console.log(`🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}" (Página ${page})`);
 
-        // 🔹 1. Pré-processa a pesquisa
-        const processedQuery = preprocessQuery(query);
-        if (!processedQuery.isLegal) {
-            return res.json({ message: "❌ A pesquisa parece não estar relacionada a leis. Tente algo como 'Lei de trânsito no Brasil'." });
+        // 🔹 1. Validação semântica da pesquisa
+        if (!isValidLegalQuery(query)) {
+            return res.json({ message: "❌ Sua pesquisa não parece estar relacionada a legislação. Você pode tentar reformular sua pergunta?" });
         }
 
         const cacheKey = `search-law:${query}:page:${page}`;
         const cachedData = await client.get(cacheKey);
+
         if (cachedData) {
             console.log(`♻️ Resultado recuperado do cache para "${query}" (Página ${page})`);
             return res.json(JSON.parse(cachedData));
         }
 
         // 🔹 2. Busca no Google com paginação
-        let results = await searchGoogle(processedQuery.query, startIndex);
+        let results = await searchGoogle(query, startIndex);
 
         if (results === null) {
             console.log("❌ Erro ao buscar no Google, retornando erro para o bot.");
@@ -131,14 +141,8 @@ app.get(['/search', '/buscar'], async (req, res) => {
 
         // 🔥 3. Nenhum resultado encontrado? Sugere uma alternativa baseada na pesquisa original
         console.log("⚠️ Nenhuma legislação encontrada, gerando sugestão automática...");
-        const suggestedQuery = generateSuggestion(query);
-        
         return res.json({
-            message: `⚠️ Nenhum resultado encontrado para "${query}". O que acha de pesquisar por: *"${suggestedQuery}"*?`,
-            options: {
-                "1": `🔍 Sim, pesquisar por "${suggestedQuery}"`,
-                "2": "❌ Não, quero refazer minha busca"
-            }
+            message: `⚠️ Nenhum resultado encontrado para "${query}". Você pode tentar reformular sua pergunta.`,
         });
 
     } catch (error) {
