@@ -22,12 +22,13 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const GOOGLE_CX = process.env.GOOGLE_CX;
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 
-if (!GOOGLE_API_KEY || !GOOGLE_CX) {
-    console.error("❌ ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY ou GOOGLE_CX). ");
+if (!GOOGLE_API_KEY || !GOOGLE_CX || !MISTRAL_API_KEY) {
+    console.error("❌ ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY, GOOGLE_CX ou MISTRAL_API_KEY).");
     process.exit(1);
 }
 
 const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=`;
+const MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions";
 
 // 📌 Dicionário de palavras-chave jurídicas
 const keywords = [
@@ -46,7 +47,7 @@ function isValidLegalQuery(query) {
 
     const words = query.toLowerCase().split(" ");
 
-    // Garante que 'words' seja um array antes de remover stopwords
+    // Verifica se `words` é um array antes de remover stopwords
     let filteredWords;
     try {
         filteredWords = stopwords.removeStopwords(words, stopwordsPt);
@@ -93,6 +94,23 @@ async function searchGoogle(query, start = 1) {
     }
 }
 
+// 🔍 **Reformulação da pesquisa usando Mistral AI**
+async function reformulateQuery(originalQuery) {
+    try {
+        const response = await axios.post(MISTRAL_API_URL, {
+            model: "mistral-7b-instruct",
+            messages: [{ role: "user", content: `Essa pesquisa "${originalQuery}" não retornou nada. Reformule para que faça sentido em um contexto jurídico.` }]
+        }, {
+            headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` }
+        });
+
+        return response.data.choices?.[0]?.message?.content || originalQuery;
+    } catch (error) {
+        console.error("❌ Erro ao reformular a pesquisa com Mistral AI:", error.message);
+        return originalQuery;
+    }
+}
+
 // 📜 **Endpoint principal para pesquisa de leis com sugestões inteligentes**
 app.get(['/search', '/buscar'], async (req, res) => {
     try {
@@ -108,7 +126,13 @@ app.get(['/search', '/buscar'], async (req, res) => {
 
         // 🔹 1. Validação semântica da pesquisa
         if (!isValidLegalQuery(query)) {
-            return res.json({ message: "❌ Sua pesquisa não parece estar relacionada a legislação. Você pode tentar reformular sua pergunta?" });
+            console.log("⚠️ Pesquisa sem contexto jurídico. Reformulando...");
+            const reformulatedQuery = await reformulateQuery(query);
+
+            return res.json({
+                message: `❌ Sua pesquisa original não parece estar relacionada à legislação. Mas encontramos uma possível alternativa:`,
+                suggestion: reformulatedQuery
+            });
         }
 
         const cacheKey = `search-law:${query}:page:${page}`;
@@ -139,10 +163,13 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json(responsePayload);
         }
 
-        // 🔥 3. Nenhum resultado encontrado? Sugere uma alternativa baseada na pesquisa original
-        console.log("⚠️ Nenhuma legislação encontrada, gerando sugestão automática...");
+        // 🔥 3. Nenhum resultado encontrado? Reformular com Mistral AI
+        console.log("⚠️ Nenhuma legislação encontrada, tentando reformular...");
+        const reformulatedQuery = await reformulateQuery(query);
+
         return res.json({
-            message: `⚠️ Nenhum resultado encontrado para "${query}". Você pode tentar reformular sua pergunta.`,
+            message: `⚠️ Nenhum resultado encontrado para "${query}". Você pode tentar reformular para:`,
+            suggestion: reformulatedQuery
         });
 
     } catch (error) {
@@ -158,3 +185,4 @@ app.listen(PORT, () => {
     console.log(`🚀 Alias disponíveis: "/search" e "/buscar"`);
     console.log(`🚀 =========================================`);
 });
+
