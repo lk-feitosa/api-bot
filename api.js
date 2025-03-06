@@ -114,7 +114,7 @@ app.get(['/search', '/buscar'], async (req, res) => {
         if (results.length > 0) {
             console.log(`✅ ${results.length} resultados encontrados para "${query}" (Página ${page})`);
             return res.json({
-                message: `📜 Encontramos ${results.length} leis relacionadas.",
+                message: `📜 Encontramos ${results.length} leis relacionadas.`,
                 results,
                 nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
             });
