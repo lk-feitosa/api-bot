@@ -28,16 +28,34 @@ if (!GOOGLE_API_KEY || !GOOGLE_CX || !MISTRAL_API_KEY) {
 const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=`;
 const MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions";
 
+// 📌 **Lista de palavras-chave jurídicas**
+const legalKeywords = [
+    "lei", "código", "regulamento", "norma", "direito", "portaria",
+    "decreto", "constituição", "jurídico", "justiça", "processo", "legislação",
+    "estatuto", "resolução", "tribunal", "decisão", "juiz", "promulgação", "sancionada"
+];
+
+// 📌 **Verifica se a pesquisa já é válida juridicamente**
+function isLegalQuery(query) {
+    const words = query.toLowerCase().split(" ");
+    return words.some(word => legalKeywords.includes(word));
+}
+
 // 📌 **Validação e reformulação da pesquisa**
 async function validateAndReformulateQuery(query) {
+    if (isLegalQuery(query)) {
+        console.log(`✅ Pesquisa já válida juridicamente: "${query}"`);
+        return query; // Não precisa reformular
+    }
+
     try {
         console.log(`🤖 Verificando se a pesquisa faz sentido jurídico: "${query}"`);
         
         const response = await axios.post(MISTRAL_API_URL, {
-            model: "mistral-small", // 🔄 Corrigido para um modelo válido
+            model: "mistral-small",
             messages: [{
                 role: "user",
-                content: `A seguinte pesquisa de lei faz sentido jurídico? "${query}". Se não fizer, reformule para algo juridicamente correto e relevante. Responda apenas com a reformulação ou escreva 'INVÁLIDO' se a pesquisa não puder ser reformulada.`
+                content: `A seguinte pesquisa de lei faz sentido jurídico? "${query}". Se fizer sentido, responda apenas com "VÁLIDO". Se não fizer, responda apenas com "INVÁLIDO".`
             }]
         }, {
             headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` }
@@ -49,14 +67,14 @@ async function validateAndReformulateQuery(query) {
 
         if (!reformulatedQuery || reformulatedQuery.toUpperCase() === "INVÁLIDO") {
             console.log(`🚫 Pesquisa inválida detectada: "${query}"`);
-            return null; // Indica que a pesquisa não faz sentido jurídico
+            return null; // Impede a pesquisa no Google
         }
 
-        console.log(`✅ Pesquisa reformulada para: "${reformulatedQuery}"`);
-        return reformulatedQuery;
+        console.log(`✅ Pesquisa confirmada como válida: "${query}"`);
+        return query;
     } catch (error) {
         console.error("❌ Erro ao validar/reformular a pesquisa com Mistral AI:", error.response?.data || error.message);
-        return null;  // Retorna null para impedir a busca no Google
+        return null; // Retorna null para impedir a busca no Google
     }
 }
 
@@ -105,14 +123,6 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json({
                 message: "❌ Sua pesquisa não faz sentido jurídico.",
                 suggestion: "Tente reformular sua pergunta para algo relacionado a leis."
-            });
-        }
-
-        if (validatedQuery !== query) {
-            console.log(`🔄 Pesquisa reformulada para: "${validatedQuery}"`);
-            return res.json({
-                message: "⚠️ Sua pesquisa foi reformulada para algo mais adequado:",
-                suggestion: validatedQuery
             });
         }
 
