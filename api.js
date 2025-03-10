@@ -41,11 +41,21 @@ function isLegalQuery(query) {
     return words.some(word => legalKeywords.includes(word));
 }
 
+// 📌 **Adiciona "Lei" automaticamente se necessário**
+function ensureLawPrefix(query) {
+    const words = query.toLowerCase().split(" ");
+    if (!legalKeywords.includes(words[0])) {
+        return `Lei ${query}`;
+    }
+    return query;
+}
+
 // 📌 **Validação e reformulação da pesquisa**
 async function validateAndReformulateQuery(query) {
+    query = ensureLawPrefix(query); // Garante que "Lei" está no início
+
     if (isLegalQuery(query)) {
-        console.log(`✅ Pesquisa já válida juridicamente: "${query}"`);
-        return query; // Não precisa reformular
+        return { query, suggestion: null };
     }
 
     try {
@@ -55,26 +65,23 @@ async function validateAndReformulateQuery(query) {
             model: "mistral-small",
             messages: [{
                 role: "user",
-                content: `A seguinte pesquisa de lei faz sentido jurídico? "${query}". Se fizer sentido, responda apenas com "VÁLIDO". Se não fizer, responda apenas com "INVÁLIDO".`
+                content: `A seguinte pesquisa de lei faz sentido jurídico? "${query}". Se fizer sentido, responda apenas com "VÁLIDO". Se não fizer, reformule para algo juridicamente correto.`
             }]
         }, {
             headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` }
         });
 
         const reformulatedQuery = response.data.choices?.[0]?.message?.content?.trim();
-
         console.log(`🔍 Resposta do Mistral: "${reformulatedQuery}"`);
 
-        if (!reformulatedQuery || reformulatedQuery.toUpperCase() === "INVÁLIDO") {
-            console.log(`🚫 Pesquisa inválida detectada: "${query}"`);
-            return null; // Impede a pesquisa no Google
+        if (!reformulatedQuery || reformulatedQuery.toUpperCase() === "VÁLIDO") {
+            return { query, suggestion: null };
         }
 
-        console.log(`✅ Pesquisa confirmada como válida: "${query}"`);
-        return query;
+        return { query: null, suggestion: reformulatedQuery };
     } catch (error) {
         console.error("❌ Erro ao validar/reformular a pesquisa com Mistral AI:", error.response?.data || error.message);
-        return null; // Retorna null para impedir a busca no Google
+        return { query, suggestion: null };
     }
 }
 
@@ -87,7 +94,6 @@ async function searchGoogle(query, start = 1) {
         const response = await axios.get(googleApiUrl);
 
         if (!response.data.items || response.data.items.length === 0) {
-            console.log("⚠️ Nenhum resultado encontrado.");
             return [];
         }
 
@@ -116,26 +122,23 @@ app.get(['/search', '/buscar'], async (req, res) => {
 
         console.log(`🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}" (Página ${page})`);
 
-        // 🔹 1. Validar a pesquisa **antes** de pesquisar no Google
-        const validatedQuery = await validateAndReformulateQuery(query);
+        const { query: validatedQuery, suggestion } = await validateAndReformulateQuery(query);
         
         if (!validatedQuery) {
             return res.json({
-                message: "❌ Sua pesquisa não faz sentido jurídico.",
-                suggestion: "Tente reformular sua pergunta para algo relacionado a leis."
+                message: "⚠️ Sua pesquisa pode ser reformulada para algo mais adequado.",
+                suggestion,
+                options: ["🔍 Sim, pesquisar com a sugestão", "✍️ Não, digitar outra pesquisa"]
             });
         }
 
-        // 🔹 2. Busca no Google com paginação
         let results = await searchGoogle(validatedQuery, startIndex);
 
         if (results === null) {
-            console.log("❌ Erro ao buscar no Google, retornando erro.");
             return res.status(500).json({ error: "Erro ao conectar com o Google. Tente novamente mais tarde." });
         }
 
         if (results.length > 0) {
-            console.log(`✅ ${results.length} resultados encontrados para "${validatedQuery}" (Página ${page})`);
             return res.json({
                 message: `📜 Encontramos ${results.length} leis relacionadas.`,
                 results,
@@ -143,11 +146,10 @@ app.get(['/search', '/buscar'], async (req, res) => {
             });
         }
 
-        console.log("⚠️ Nenhuma legislação encontrada, tentando reformular...");
         return res.json({
             message: `⚠️ Nenhum resultado encontrado para "${query}". Tente reformular sua pesquisa.`,
+            suggestion: "Tente incluir palavras-chave mais específicas, como 'Lei de trânsito' ou 'Regulamento sobre saúde'."
         });
-
     } catch (error) {
         console.error('❌ Erro ao buscar lei:', error);
         res.status(500).json({ error: 'Erro ao processar a solicitação' });
