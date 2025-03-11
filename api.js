@@ -3,6 +3,8 @@ const express = require('express');
 const axios = require('axios');
 const redis = require('redis');
 const morgan = require('morgan');
+const sanitize = require('sanitize-html');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = 4000;
@@ -14,6 +16,14 @@ client.connect().catch((err) => console.error("❌ Erro ao conectar ao Redis:", 
 
 // 🔹 Middleware para logs organizados
 app.use(morgan('tiny'));
+
+// 🔹 Middleware de segurança para limitar requisições
+const limiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: "⚠️ Limite de requisições excedido. Tente novamente mais tarde."
+});
+app.use(limiter);
 
 // 🔹 Configuração de APIs externas
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -35,14 +45,14 @@ const legalKeywords = [
     "estatuto", "resolução", "tribunal", "decisão", "juiz", "promulgação", "sancionada"
 ];
 
-// 📌 **Verifica se a pesquisa já é válida juridicamente**
-function isLegalQuery(query) {
-    const words = query.toLowerCase().split(" ");
-    return words.some(word => legalKeywords.includes(word));
+// 📌 **Sanitização e Validação de Input**
+function sanitizeQuery(query) {
+    return sanitize(query.replace(/[^a-zA-Z0-9À-ÿ\s]/g, '').trim());
 }
 
 // 📌 **Garante que "Lei" está no início da pesquisa**
 function ensureLawPrefix(query) {
+    query = sanitizeQuery(query);
     const words = query.toLowerCase().split(" ");
     if (!legalKeywords.includes(words[0])) {
         return `Lei ${query}`;
@@ -54,7 +64,7 @@ function ensureLawPrefix(query) {
 async function validateAndReformulateQuery(query) {
     query = ensureLawPrefix(query);
 
-    if (isLegalQuery(query)) {
+    if (legalKeywords.some(word => query.toLowerCase().includes(word))) {
         return { query, suggestion: null };
     }
 
@@ -116,8 +126,8 @@ app.get(['/search', '/buscar'], async (req, res) => {
         const page = parseInt(req.query.page) || 1;
         const startIndex = (page - 1) * RESULTS_PER_PAGE + 1;
 
-        if (!query) {
-            return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
+        if (!query || query.length > 100) {
+            return res.status(400).json({ error: 'O parâmetro "q" é obrigatório e deve ter menos de 100 caracteres.' });
         }
 
         console.log(`🚀 🔹 [${new Date().toLocaleString()}] Nova pesquisa recebida: "${query}" (Página ${page})`);
@@ -141,17 +151,10 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.status(500).json({ error: "Erro ao conectar com o Google. Tente novamente mais tarde." });
         }
 
-        if (results.length > 0) {
-            return res.json({
-                message: `📜 Encontramos ${results.length} leis relacionadas para "${validatedQuery}"`,
-                results,
-                nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(validatedQuery)}&page=${page + 1}` : null
-            });
-        }
-
         return res.json({
-            message: `⚠️ Nenhum resultado encontrado para "${query}".`,
-            suggestion: `Experimente reformular como "Lei sobre ${query.split(" ").slice(-2).join(" ")}".`
+            message: `📜 Encontramos ${results.length} leis relacionadas para "${validatedQuery}"`,
+            results,
+            nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(validatedQuery)}&page=${page + 1}` : null
         });
     } catch (error) {
         console.error('❌ Erro ao buscar lei:', error);
