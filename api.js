@@ -41,7 +41,7 @@ function isLegalQuery(query) {
     return words.some(word => legalKeywords.includes(word));
 }
 
-// 📌 **Adiciona "Lei" automaticamente se necessário**
+// 📌 **Garante que "Lei" está no início da pesquisa**
 function ensureLawPrefix(query) {
     const words = query.toLowerCase().split(" ");
     if (!legalKeywords.includes(words[0])) {
@@ -52,7 +52,7 @@ function ensureLawPrefix(query) {
 
 // 📌 **Validação e reformulação da pesquisa**
 async function validateAndReformulateQuery(query) {
-    query = ensureLawPrefix(query); // Garante que "Lei" está no início
+    query = ensureLawPrefix(query);
 
     if (isLegalQuery(query)) {
         return { query, suggestion: null };
@@ -128,7 +128,10 @@ app.get(['/search', '/buscar'], async (req, res) => {
             return res.json({
                 message: "⚠️ Sua pesquisa pode ser reformulada para algo mais adequado.",
                 suggestion,
-                options: ["🔍 Sim, pesquisar com a sugestão", "✍️ Não, digitar outra pesquisa"]
+                options: {
+                    "1": `🔍 Sim, pesquisar por "${suggestion}"`,
+                    "2": "✍️ Não, digitar outra pesquisa"
+                }
             });
         }
 
@@ -140,15 +143,15 @@ app.get(['/search', '/buscar'], async (req, res) => {
 
         if (results.length > 0) {
             return res.json({
-                message: `📜 Encontramos ${results.length} leis relacionadas.`,
+                message: `📜 Encontramos ${results.length} leis relacionadas para "${validatedQuery}"`,
                 results,
                 nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(validatedQuery)}&page=${page + 1}` : null
             });
         }
 
         return res.json({
-            message: `⚠️ Nenhum resultado encontrado para "${query}". Tente reformular sua pesquisa.`,
-            suggestion: "Tente incluir palavras-chave mais específicas, como 'Lei de trânsito' ou 'Regulamento sobre saúde'."
+            message: `⚠️ Nenhum resultado encontrado para "${query}".`,
+            suggestion: `Experimente reformular como "Lei sobre ${query.split(" ").slice(-2).join(" ")}".`
         });
     } catch (error) {
         console.error('❌ Erro ao buscar lei:', error);
