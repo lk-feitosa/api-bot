@@ -29,8 +29,6 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-app.use(express.json());
-
 // 🔹 Configuração de APIs externas
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 const GOOGLE_CX = process.env.GOOGLE_CX;
@@ -88,7 +86,8 @@ async function validateAndReformulateQuery(query) {
                 content: `A seguinte pesquisa de lei faz sentido jurídico? "${query}". Se fizer sentido, responda apenas com "VÁLIDO". Se não fizer, reformule para algo juridicamente correto.`
             }]
         }, {
-            headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` }
+            headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
+            timeout: 5000  // ⏳ Adicionando timeout para evitar travamentos
         });
 
         const reformulatedQuery = response.data.choices?.[0]?.message?.content?.trim();
@@ -100,60 +99,24 @@ async function validateAndReformulateQuery(query) {
 
         return { query: null, suggestion: reformulatedQuery };
     } catch (error) {
-        logAction("ERRO", "Erro ao validar pesquisa com Mistral AI: " + error.message);
+        logAction("ERRO", "Mistral AI indisponível. Continuando sem validação...");
         return { query, suggestion: null };
     }
 }
 
-// 📜 **Endpoint para buscar leis**
-app.get(['/search', '/buscar'], async (req, res) => {
+// 🔍 **Função para buscar no Google Custom Search**
+async function searchGoogle(query) {
     try {
-        const query = req.query.q;
-        if (!query) {
-            return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
-        }
-
-        logAction("BUSCA", `Recebendo pesquisa: ${query}`);
-
-        const { query: validatedQuery, suggestion } = await validateAndReformulateQuery(query);
-
-        if (!validatedQuery) {
-            return res.json({
-                message: "⚠️ Sua pesquisa pode ser reformulada para algo mais adequado.",
-                suggestion,
-                options: {
-                    "1": `🔍 Sim, pesquisar por "${suggestion}"`,
-                    "2": "✍️ Não, digitar outra pesquisa"
-                }
-            });
-        }
-
-        const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(validatedQuery)}&num=${RESULTS_PER_PAGE}`;
-
-        logAction("API GOOGLE", `Buscando leis para: ${validatedQuery}`);
+        const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=${RESULTS_PER_PAGE}`;
+        logAction("GOOGLE", `Buscando no Google: ${query}`);
+        
         const response = await axios.get(googleApiUrl);
-
-        if (!response.data.items || response.data.items.length === 0) {
-            return res.json({
-                message: `⚠️ Nenhuma lei encontrada para "${query}".`
-            });
-        }
-
-        return res.json({
-            message: `📜 Encontramos ${response.data.items.length} leis para "${validatedQuery}"`,
-            results: response.data.items.map(item => ({
-                title: item.title,
-                link: item.link,
-                snippet: item.snippet,
-                source: new URL(item.link).hostname
-            }))
-        });
-
+        return response.data.items || [];
     } catch (error) {
-        logAction("ERRO", "Erro ao buscar leis: " + error.message);
-        res.status(500).json({ error: "Erro ao processar a solicitação." });
+        logAction("ERRO", `Erro ao buscar no Google: ${error.message}`);
+        return [];
     }
-});
+}
 
 // 📜 **Endpoint para analisar PDF e buscar leis similares**
 app.post('/analisar-pdf', upload.single('file'), async (req, res) => {
@@ -182,7 +145,9 @@ app.post('/analisar-pdf', upload.single('file'), async (req, res) => {
         logAction("PDF", `Texto extraído: ${extractedText.substring(0, 200)}`);
         let results = await searchGoogle(extractedText);
         if (!results || results.length === 0) {
-            return res.json({ message: `⚠️ Nenhuma lei similar encontrada.` });
+            return res.json({
+                message: `⚠️ Nenhuma lei similar encontrada.\n\n💡 *Dica:* Tente reformular sua pesquisa começando com "Lei".`
+            });
         }
 
         return res.json({
@@ -191,7 +156,10 @@ app.post('/analisar-pdf', upload.single('file'), async (req, res) => {
         });
     } catch (error) {
         logAction("ERRO", "Erro ao processar o PDF: " + error.message);
-        res.status(500).json({ error: "Erro ao analisar o documento." });
+        res.status(500).json({
+            error: "Erro ao analisar o documento.",
+            details: error.message
+        });
     }
 });
 
