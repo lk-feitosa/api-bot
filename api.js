@@ -14,6 +14,9 @@ const PORT = 4000;
 const RESULTS_PER_PAGE = 4;
 const upload = multer();
 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 // 🔹 Configuração do Redis
 const client = redis.createClient();
 client.connect().catch((err) => console.error("❌ [API] Erro ao conectar ao Redis:", err));
@@ -35,11 +38,11 @@ const GOOGLE_CX = process.env.GOOGLE_CX;
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 
 if (!GOOGLE_API_KEY || !GOOGLE_CX || !MISTRAL_API_KEY) {
-    console.error("❌ [API] ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY, GOOGLE_CX ou MISTRAL_API_KEY).");
+    console.error("❌ [API] ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY, GOOGLE_CX ou MISTRAL_API_KEY). ");
     process.exit(1);
 }
 
-const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}&q=`;
+const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}`;
 const MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions";
 
 // 📌 **Função de Log**
@@ -69,98 +72,55 @@ function ensureLawPrefix(query) {
     return query;
 }
 
-// 📌 **Validação e reformulação da pesquisa**
-async function validateAndReformulateQuery(query) {
-    query = ensureLawPrefix(query);
-
-    if (legalKeywords.some(word => query.toLowerCase().includes(word))) {
-        return { query, suggestion: null };
-    }
-
-    try {
-        logAction("MISTRAL", `Validando pesquisa: ${query}`);
-        const response = await axios.post(MISTRAL_API_URL, {
-            model: "mistral-small",
-            messages: [{
-                role: "user",
-                content: `A seguinte pesquisa de lei faz sentido jurídico? "${query}". Se fizer sentido, responda apenas com "VÁLIDO". Se não fizer, reformule para algo juridicamente correto.`
-            }]
-        }, {
-            headers: { Authorization: `Bearer ${MISTRAL_API_KEY}` },
-            timeout: 5000  // ⏳ Adicionando timeout para evitar travamentos
-        });
-
-        const reformulatedQuery = response.data.choices?.[0]?.message?.content?.trim();
-        logAction("MISTRAL", `Resposta do Mistral: ${reformulatedQuery}`);
-
-        if (!reformulatedQuery || reformulatedQuery.toUpperCase() === "VÁLIDO") {
-            return { query, suggestion: null };
-        }
-
-        return { query: null, suggestion: reformulatedQuery };
-    } catch (error) {
-        logAction("ERRO", "Mistral AI indisponível. Continuando sem validação...");
-        return { query, suggestion: null };
-    }
-}
-
-// 🔍 **Função para buscar no Google Custom Search**
+// 📌 **Busca no Google Custom Search com priorização para o Brasil**
 async function searchGoogle(query) {
+    const googleApiUrl = `${CUSTOM_SEARCH_URL}&q=${encodeURIComponent(query)}&num=${RESULTS_PER_PAGE}&gl=br`;
+
     try {
-        const googleApiUrl = `${CUSTOM_SEARCH_URL}${encodeURIComponent(query)}&num=${RESULTS_PER_PAGE}`;
-        logAction("GOOGLE", `Buscando no Google: ${query}`);
-        
+        logAction("API", `🔍 Buscando no Google: ${query}`);
         const response = await axios.get(googleApiUrl);
         return response.data.items || [];
     } catch (error) {
-        logAction("ERRO", `Erro ao buscar no Google: ${error.message}`);
+        logAction("ERRO", "Erro ao buscar no Google: " + error.message);
         return [];
     }
 }
 
-// 📜 **Endpoint para analisar PDF e buscar leis similares**
-app.post('/analisar-pdf', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) {
-            return res.status(400).json({ error: "Nenhum arquivo enviado." });
-        }
+// 📜 **Endpoint para buscar leis** (Aceita GET e POST)
+app.get(['/search', '/buscar'], async (req, res) => {
+    let query = req.query.q;
+    if (!query) {
+        return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
+    }
+    query = ensureLawPrefix(query);
+    logAction("API", `Pesquisa recebida: ${query}`);
 
-        logAction("PDF", `Recebido arquivo: ${req.file.originalname}`);
-        const buffer = req.file.buffer;
-        let extractedText = "";
-
-        try {
-            const pdfData = await pdfParse(buffer);
-            extractedText = pdfData.text.trim();
-        } catch (err) {
-            logAction("OCR", "PDF não pode ser lido diretamente, tentando OCR...");
-            const ocrResult = await Tesseract.recognize(buffer, 'por');
-            extractedText = ocrResult.data.text.trim();
-        }
-
-        if (!extractedText || extractedText.length < 50 || !legalKeywords.some(word => extractedText.toLowerCase().includes(word))) {
-            return res.json({ message: "⚠️ O documento enviado não parece ser um projeto de lei válido." });
-        }
-
-        logAction("PDF", `Texto extraído: ${extractedText.substring(0, 200)}`);
-        let results = await searchGoogle(extractedText);
-        if (!results || results.length === 0) {
-            return res.json({
-                message: `⚠️ Nenhuma lei similar encontrada.\n\n💡 *Dica:* Tente reformular sua pesquisa começando com "Lei".`
-            });
-        }
-
+    let results = await searchGoogle(query);
+    if (!results || results.length === 0) {
         return res.json({
-            message: "📜 Encontramos leis similares!",
-            results: results.slice(0, 5)
-        });
-    } catch (error) {
-        logAction("ERRO", "Erro ao processar o PDF: " + error.message);
-        res.status(500).json({
-            error: "Erro ao analisar o documento.",
-            details: error.message
+            message: `⚠️ Nenhuma lei encontrada para "${query}".\n\n💡 *Dica:* Tente reformular sua pesquisa começando com "Lei".`
         });
     }
+
+    return res.json({ message: "📜 Leis encontradas:", results: results.slice(0, 5) });
+});
+
+app.post('/buscar', async (req, res) => {
+    let query = req.body.q;
+    if (!query) {
+        return res.status(400).json({ error: 'O parâmetro "q" é obrigatório no corpo da requisição' });
+    }
+    query = ensureLawPrefix(query);
+    logAction("API", `Pesquisa recebida via POST: ${query}`);
+
+    let results = await searchGoogle(query);
+    if (!results || results.length === 0) {
+        return res.json({
+            message: `⚠️ Nenhuma lei encontrada para "${query}".\n\n💡 *Dica:* Tente reformular sua pesquisa começando com "Lei".`
+        });
+    }
+
+    return res.json({ message: "📜 Leis encontradas:", results: results.slice(0, 5) });
 });
 
 // 🚀 **Inicia a API**
