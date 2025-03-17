@@ -1,0 +1,442 @@
+BOT:
+require('dotenv').config();
+const fs = require('fs');
+const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const axios = require('axios');
+const redis = require('redis');
+const SESSION_DIR = './sessions';
+const API_URL = process.env.API_URL || "http://localhost:4000";
+const ALLOW_GROUPS = process.env.ALLOW_GROUPS === 'true';
+
+// 🔹 Criação da pasta de sessão caso não exista
+if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR);
+
+// 🔹 Conexão com Redis para armazenar o estado dos usuários
+const client = redis.createClient();
+client.connect().catch(err => console.error("❌ Erro ao conectar ao Redis:", err));
+
+/**
+ * 🛠 Salva o estado do usuário no Redis
+ */
+async function saveUserState(sender, state) {
+    await client.set(`user:${sender}`, JSON.stringify(state), { EX: 600 }); // Expira em 10 minutos
+}
+
+/**
+ * 🛠 Obtém o estado do usuário armazenado no Redis
+ */
+async function getUserState(sender) {
+    const data = await client.get(`user:${sender}`);
+    return data ? JSON.parse(data) : { status: "menu_inicial" };
+}
+
+/**
+ * 🛠 Remove o estado do usuário, voltando ao estado inicial
+ */
+async function deleteUserState(sender) {
+    await client.del(`user:${sender}`);
+}
+
+/**
+ * 📨 Envia a mensagem inicial do bot com as opções do menu principal
+ */
+async function sendInitialMessage(sender, conn) {
+    console.log(`📩 [BOT] Enviando mensagem inicial para ${sender}...`);
+    await deleteUserState(sender);
+    const greeting = getGreeting();
+    const message = `${greeting} Eu sou o *Assistente Inteligente ALETO*.
+
+📜 *Posso ajudar a encontrar leis e regulamentos para análise.*
+
+1️⃣ 📑 Enviar um PDF  
+2️⃣ 🔍 Pesquisar uma lei  
+3️⃣ ❌ Sair  
+
+💡 *Dica:* Sempre inicie sua pesquisa com a palavra *Lei*  
+Exemplo: *Lei sobre transporte gratuito.*`;
+
+    await conn.sendMessage(sender, { text: message });
+}
+
+/**
+ * 🔍 Processa a pesquisa de leis na API e retorna os resultados
+ */
+async function processSearch(query, sender, conn, page = 1) {
+    try {
+        console.log(`🚀 [API] Enviando pesquisa para a API: ${query}`);
+        const response = await axios.get(`${API_URL}/buscar`, { params: { q: query, page } });
+
+        console.log("✅ [API] Resposta recebida com sucesso!");
+        const data = response.data;
+
+        if (!data.results || data.results.length === 0) {
+            await conn.sendMessage(sender, { text: "⚠️ Nenhuma lei encontrada para essa pesquisa." });
+            return;
+        }
+/**
+* 🔹 Formata a resposta da pesquisa textual (sem similaridade).
+*/
+        let message = "📜 *Leis relacionadas encontradas:*\n\n";
+        data.results.forEach((law, index) => {
+            message += `📌 *${index + 1}. ${law.title}*\n`; // 🔹 Exibe o título da lei encontrada
+            message += `📄 *Resumo:* ${law.snippet || "Sem resumo disponível."}\n`; // 🔹 Mostra o resumo da lei
+            message += `🔗 [🔎 Acesse Aqui](${law.link})\n\n`; // 🔹 Adiciona o link para acessar a lei completa
+        });
+
+        console.log("📤 [BOT] Enviando resultado da pesquisa...");
+        await conn.sendMessage(sender, { text: message });
+
+        // 🔹 Adicionando **menu pós-pesquisa**
+        await conn.sendMessage(sender, {
+            text: "🔘 *Escolha uma opção abaixo:*\n\n" +
+                "1️⃣ 📑 Buscar mais leis similares...\n" +
+                "2️⃣ 🔍 Fazer uma nova pesquisa\n" +
+                "3️⃣ ❌ Sair"
+        });
+
+        // 🔹 Mudando o estado do usuário para menu_pesquisa
+        await saveUserState(sender, { status: "menu_pesquisa", last_query: query, page });
+
+    } catch (error) {
+        console.error("❌ [API] Erro ao processar pesquisa:", error.message);
+        await conn.sendMessage(sender, { text: "❌ Erro ao buscar leis. Tente novamente mais tarde." });
+    }
+}
+
+/**
+ * 🚀 Inicia o bot e gerencia eventos de mensagens
+ */
+async function startBot() {
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    const conn = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+        browser: ["Ubuntu", "Chrome", "22.04.4"],
+        syncFullHistory: true,
+    });
+
+    conn.ev.on('creds.update', saveCreds);
+
+    conn.ev.on('messages.upsert', async (message) => {
+        console.log("📥 [BOT] Nova mensagem recebida!");
+        const msg = message.messages[0];
+        if (!msg || msg.key.fromMe || !msg.message) return;
+
+        const sender = msg.key.remoteJid;
+        if (sender.endsWith("@g.us") && !ALLOW_GROUPS) {
+            console.log("🚫 [BOT] Mensagem de grupo ignorada.");
+            return;
+        }
+
+        let text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+        const normalizedText = text.toLowerCase().trim();
+        let userStatus = await getUserState(sender);
+
+        console.log(`📌 [BOT] Estado do usuário (${sender}): ${JSON.stringify(userStatus)}`);
+
+        if (userStatus.status === "waiting_law" && text) {
+            console.log("🔍 [BOT] Processando pesquisa de lei...");
+            await processSearch(text, sender, conn);
+            return;
+        }
+
+        if (userStatus.status === "menu_pesquisa") {
+            if (/^1$|buscar.*mais/i.test(normalizedText)) {
+                console.log("🔍 [BOT] Usuário quer buscar mais leis similares...");
+                await conn.sendMessage(sender, { text: "🔎 Buscando mais leis similares..." });
+            
+                // Obtém a próxima página (se não tiver, assume página 2)
+                const nextPage = userStatus.page ? userStatus.page + 1 : 2;
+            
+                await processSearch(userStatus.last_query, sender, conn, nextPage);
+                return;
+            }            
+            if (/^2$|nova.*pesquisa/i.test(normalizedText)) {
+                console.log("📌 [BOT] Usuário quer fazer uma nova pesquisa.");
+                await saveUserState(sender, { status: "waiting_law" });
+                await conn.sendMessage(sender, { text: "✍️ *Digite o texto sobre a lei que deseja pesquisar:*\n💡 *Dica:* Sempre inicie sua pesquisa com a palavra *Lei*" });
+                return;
+            }
+            if (/^3$|sair|encerrar/i.test(normalizedText)) {
+                console.log("🔚 [BOT] Usuário escolheu sair. Encerrando interação.");
+                
+                await conn.sendMessage(sender, { text: "✅ *Sessão encerrada.* Se precisar novamente, basta enviar 'Oi'." });
+                
+                await deleteUserState(sender); // 🔹 Agora, reseta o estado corretamente
+                return;
+            }
+        }
+
+        if (/^(oi|olá|bom dia|boa tarde|boa noite)$/i.test(normalizedText)) {
+            console.log("🔹 [BOT] Cumprimento detectado, enviando mensagem inicial.");
+            await sendInitialMessage(sender, conn);
+            return;
+        }
+
+        if (userStatus.status === "menu_inicial") {
+            if (/^1$|enviar.*pdf/i.test(normalizedText)) {
+                console.log("📌 [BOT] Usuário quer enviar um PDF.");
+                await saveUserState(sender, { status: "waiting_pdf" });
+                await conn.sendMessage(sender, { text: "📄 *Aguardando o envio do PDF...*\nCaso queira cancelar, digite *3 - ❌ Sair*." });
+                return;
+            }
+            if (/^2$|pesquisar.*lei/i.test(normalizedText)) {
+                console.log("📌 [BOT] Usuário quer pesquisar uma lei.");
+                await saveUserState(sender, { status: "waiting_law" });
+                await conn.sendMessage(sender, { text: "✍️ *Digite o texto sobre a lei que deseja pesquisar:*\n💡 *Dica:* Sempre inicie sua pesquisa com a palavra *Lei*" });
+                return;
+            }
+        }
+    });
+}
+
+/**
+ * ⏰ Retorna uma saudação personalizada baseada no horário do dia
+ */
+function getGreeting() {
+    const hora = new Date().getHours();
+    if (hora >= 5 && hora < 12) return "🌅 Bom dia!";
+    if (hora >= 12 && hora < 18) return "🌞 Boa tarde!";
+    return "🌙 Boa noite!";
+}
+
+/**
+ * 📄 Processa um PDF enviado, realiza a busca na API e retorna leis similares com % de similaridade.
+ */
+async function processPDF(sender, conn, fileBuffer, fileName) {
+    try {
+        console.log("📄 [BOT] PDF recebido. Processando...");
+        await conn.sendMessage(sender, { text: "📄 *Documento recebido!* Analisando leis similares, aguarde..." });
+
+        const formData = new FormData();
+        formData.append("file", fileBuffer, { filename: fileName });
+
+        console.log("🚀 [API] Enviando PDF para análise...");
+        const response = await axios.post(`${API_URL}/analisar-pdf`, formData, {
+            headers: { ...formData.getHeaders() }
+        });
+
+        console.log("✅ [API] Resposta recebida com sucesso!");
+        const data = response.data;
+
+        if (!data.results || data.results.length === 0) {
+            console.log("⚠️ [BOT] Nenhuma lei similar encontrada.");
+            await conn.sendMessage(sender, { text: "⚠️ Nenhuma lei similar encontrada para este documento." });
+            return;
+        }
+
+        /**
+         * 🔹 Formata a resposta para pesquisa via PDF (incluindo similaridade %).
+         */
+        let message = "📜 *Leis similares encontradas:* \n\n";
+        data.results.forEach((law, index) => {
+            message += `📌 *${law.title}*\n`; // 🔹 Exibe o título da lei similar encontrada
+            message += `🔍 *Similaridade:* ${law.similarity ? `${law.similarity}%` : "N/A"}\n`; // 🔹 Exibe a % de similaridade
+            message += `📄 *Resumo:* ${law.summary || law.snippet || "Sem resumo disponível."}\n`; // 🔹 Mostra um resumo da lei
+            message += `🔗 [Acesse Aqui](${law.link})\n\n`; // 🔹 Adiciona o link para acessar a lei completa
+        });
+
+        console.log("📤 [BOT] Enviando resultado para o usuário...");
+        await conn.sendMessage(sender, { text: message });
+
+        // 🔹 Após enviar a resposta, apaga o estado do usuário
+        await deleteUserState(sender);
+    } catch (error) {
+        console.error("❌ [API] Erro ao processar PDF:", error.message);
+        await conn.sendMessage(sender, { text: "❌ Erro ao processar o PDF. Tente novamente mais tarde." });
+    }
+}
+
+// 🚀 Inicia o bot
+startBot();
+module.exports = { startBot };
+
+
+
+
+
+
+
+
+
+
+API:
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const redis = require('redis');
+const morgan = require('morgan');
+const sanitize = require('sanitize-html');
+const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
+const Tesseract = require('tesseract.js');
+
+const app = express();
+const PORT = 4000;
+const RESULTS_PER_PAGE = 5;
+const upload = multer();
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// 🔹 Configuração do Redis
+const client = redis.createClient();
+client.connect().catch((err) => console.error("❌ [API] Erro ao conectar ao Redis:", err));
+
+// 🔹 Middleware para logs organizados
+app.use(morgan('tiny'));
+
+// 🔹 Middleware de segurança para limitar requisições
+const limiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: "⚠️ [API] Limite de requisições excedido. Tente novamente mais tarde."
+});
+app.use(limiter);
+
+// 🔹 Configuração de APIs externas
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_CX = process.env.GOOGLE_CX;
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
+
+if (!GOOGLE_API_KEY || !GOOGLE_CX || !MISTRAL_API_KEY) {
+    console.error("❌ [API] ERRO: Faltando variáveis de ambiente (GOOGLE_API_KEY, GOOGLE_CX ou MISTRAL_API_KEY). ");
+    process.exit(1);
+}
+
+const CUSTOM_SEARCH_URL = `https://www.googleapis.com/customsearch/v1?key=${GOOGLE_API_KEY}&cx=${GOOGLE_CX}`;
+const MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions";
+
+// 📌 **Função de Log**
+function logAction(type, message) {
+    console.log(`📌 [${type.toUpperCase()}] ${message}`);
+}
+
+// 📌 **Lista de palavras-chave jurídicas**
+const legalKeywords = [
+    "lei", "código", "regulamento", "norma", "direito", "portaria",
+    "decreto", "constituição", "jurídico", "justiça", "processo", "legislação",
+    "estatuto", "resolução", "tribunal", "decisão", "juiz", "promulgação", "sancionada"
+];
+
+// 📌 **Sanitização e Validação de Input**
+function sanitizeQuery(query) {
+    return sanitize(query.replace(/[^a-zA-Z0-9À-ÿ\s]/g, '').trim());
+}
+
+// 📌 **Garante que "Lei" está no início da pesquisa**
+function ensureLawPrefix(query) {
+    query = sanitizeQuery(query);
+    const words = query.toLowerCase().split(" ");
+    if (!legalKeywords.includes(words[0])) {
+        return `Lei ${query}`;
+    }
+    return query;
+}
+
+// 📌 **Busca no Google Custom Search com paginação**
+async function searchGoogle(query, page = 1) {
+    const startIndex = (page - 1) * RESULTS_PER_PAGE + 1;
+    const googleApiUrl = `${CUSTOM_SEARCH_URL}&q=${encodeURIComponent(query)}&num=${RESULTS_PER_PAGE}&gl=br&start=${startIndex}`;
+
+    try {
+        logAction("API", `🔍 Buscando no Google: ${query} (Página ${page})`);
+        const response = await axios.get(googleApiUrl);
+
+        if (!response.data.items) return [];
+
+        // 🔹 Filtra possíveis duplicações nos resultados
+        const uniqueResults = response.data.items.filter((item, index, self) =>
+            index === self.findIndex((t) => t.link === item.link)
+        );
+
+        return uniqueResults;
+    } catch (error) {
+        logAction("ERRO", "Erro ao buscar no Google: " + error.message);
+        return [];
+    }
+}
+
+// 📜 **Endpoint para buscar leis com suporte à paginação**
+app.get(['/search', '/buscar'], async (req, res) => {
+    let query = req.query.q;
+    let page = parseInt(req.query.page) || 1;
+
+    if (!query) {
+        return res.status(400).json({ error: 'O parâmetro "q" é obrigatório' });
+    }
+
+    query = ensureLawPrefix(query);
+    logAction("API", `Pesquisa recebida: ${query} - Página ${page}`);
+
+    const cacheKey = `search-law:${query}:page:${page}`;
+    const cachedData = await client.get(cacheKey);
+
+    if (cachedData) {
+        logAction("CACHE", `♻️ Recuperando do cache para "${query}" (Página ${page})`);
+        return res.json(JSON.parse(cachedData));
+    }
+
+    let results = await searchGoogle(query, page);
+
+    if (!results || results.length === 0) {
+        return res.json({
+            message: `⚠️ Nenhuma lei encontrada para "${query}".\n\n💡 *Dica:* Tente reformular sua pesquisa começando com "Lei".`
+        });
+    }
+
+    const responsePayload = {
+        message: "📜 Leis encontradas:",
+        results: results.slice(0, RESULTS_PER_PAGE),
+        nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
+    };
+
+    await client.setEx(cacheKey, 1800, JSON.stringify(responsePayload)); // Cache por 30 minutos
+
+    return res.json(responsePayload);
+});
+
+app.post('/buscar', async (req, res) => {
+    let query = req.body.q;
+    let page = parseInt(req.body.page) || 1;
+
+    if (!query) {
+        return res.status(400).json({ error: 'O parâmetro "q" é obrigatório no corpo da requisição' });
+    }
+
+    query = ensureLawPrefix(query);
+    logAction("API", `Pesquisa recebida via POST: ${query} - Página ${page}`);
+
+    const cacheKey = `search-law:${query}:page:${page}`;
+    const cachedData = await client.get(cacheKey);
+
+    if (cachedData) {
+        logAction("CACHE", `♻️ Recuperando do cache para "${query}" (Página ${page})`);
+        return res.json(JSON.parse(cachedData));
+    }
+
+    let results = await searchGoogle(query, page);
+
+    if (!results || results.length === 0) {
+        return res.json({
+            message: `⚠️ Nenhuma lei encontrada para "${query}".\n\n💡 *Dica:* Tente reformular sua pesquisa começando com "Lei".`
+        });
+    }
+
+    const responsePayload = {
+        message: "📜 Leis encontradas:",
+        results: results.slice(0, RESULTS_PER_PAGE),
+        nextPage: results.length === RESULTS_PER_PAGE ? `/buscar?q=${encodeURIComponent(query)}&page=${page + 1}` : null
+    };
+
+    await client.setEx(cacheKey, 1800, JSON.stringify(responsePayload)); // Cache por 30 minutos
+
+    return res.json(responsePayload);
+});
+
+// 🚀 **Inicia a API**
+app.listen(PORT, () => {
+    logAction("API", `API de Pesquisa de Leis rodando na porta ${PORT}`);
+    logAction("API", `Alias disponíveis: "/search", "/buscar" e "/analisar-pdf"`);
+});
